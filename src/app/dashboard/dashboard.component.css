@@ -1,0 +1,25 @@
+.logout{
+    cursor:pointer;
+  border-radius:5px;
+  padding:10px 20px 10px 0;
+  text-align:right;
+}
+li:hover { 
+  background-color: darkgray;
+  
+}
+
+span.sp{
+  color: hotpink;
+}
+
+span.heading{
+  color: brown;
+  font-family: Cambria, Cochin, Georgia, Times, 'Times New Roman', serif;
+  font-size: 37px;
+  align-content: center;
+  margin-left: 300px
+}
+.log{
+  padding-top: 0px
+}

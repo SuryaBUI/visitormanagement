@@ -1,0 +1,27 @@
+
+<h1>Hi {{data.name}}</h1>
+
+<table>
+    <tr>
+        <th>Name</th>
+        <th>Check In</th>
+        <th>Check Out</th>
+        <th>Purpose</th>
+        <th>POC</th>
+        <th>Mobile</th>
+        <th>ID Proof</th>
+      </tr>
+  <tr>
+  <td>{{data.name}}</td>
+  <td>{{data.din}}</td>
+  <td>{{data.dout}}</td>
+  <td>{{data.purpose}}</td>
+  <td>{{data.poc}}</td>
+  <td>{{data.mobile}}</td>
+  <td>{{data.idNumber}}</td>
+  </tr>
+
+  <button class="btn btn-primary btn-xs" (click)= "onHistory()">History</button>
+  <button class="btn btn-primary btn-xs " (click)= "onNoClick()">Cancel</button>
+  
+</table>

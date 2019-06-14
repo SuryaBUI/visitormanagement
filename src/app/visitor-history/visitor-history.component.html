@@ -1,0 +1,40 @@
+
+
+<nav class="navbar">
+    <input  type="text" name="search" [(ngModel)]="filter">      
+  </nav>
+
+  <button class="btn btn-primary" (click)="sort('visitorname')">Sort <span class="glyphicon sort-icon" *ngIf="key =='visitorname'" [ngClass]="{'glyphicon-chevron-up':reverse,'glyphicon-chevron-down':!reverse}"></span></button>
+  
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-xs-10">
+      <Table>
+        <tr>
+          <th>Id</th>
+          <th>Name</th>
+          <th>Check In</th>
+          <th>Check Out</th>
+          <th>Purpose</th>
+          <th>POC</th>
+          <th>Mobile</th>
+          <th>ID Proof</th>
+        </tr>
+        
+            
+              <tr *ngFor="let card of visitor |  orderBy: key : reverse | paginate: { itemsPerPage: 3, currentPage: p } | filter:filter;">
+                 <td>{{card.id}}</td>
+                 <td>{{card.visitorname}}</td>
+                 <td>{{card.datein}}</td>
+                 <td>{{card.dateout}}</td>
+                 <td>{{card.purpose}}</td>
+                 <td>{{card.poc}}</td>
+                 <td>{{card.mobile}}</td>
+                 <td>{{card.idnumber}}</td>
+              </tr>
+      </Table>
+      <pagination-controls class="pull-right" (pageChange)="p = $event"></pagination-controls>
+    </div>
+  </div>
+</div>
+

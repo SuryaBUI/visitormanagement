@@ -1,0 +1,103 @@
+
+
+<div class="container">
+  <div class="row">
+    <div class="col-xs-12 col-sm-10 col-md-8 col-offset-1 col-md-offset-2">
+      <form (ngSubmit)="onSubmit(f)" #f="ngForm">
+      <div id="visitor-data">
+      <div class="form-group">
+        <label for="visitorname">Visitor Name</label>
+        <input
+        type="text"
+        id="visitorname"
+        class="form-control"
+        ngModel
+        name="visitorname"
+        required>
+      </div>
+      
+      <div >
+        <label for="in">Check-In</label>
+        <input
+        type="date" name="date" id="in"
+        class="form-control"
+        ngModel
+
+        required
+        >
+      </div>
+      <div >
+        <label for="out">Check-Out</label>
+        <input
+        type="date" name="out" id="out"
+        class="form-control"
+        ngModel
+        required
+        >
+      </div>
+      <div class="form-group">
+        <label for="pov">Purpose of Visit</label>
+        <select
+        id="pov"
+        class="form-control"
+        ngModel
+        name="purpose"
+        required
+        >
+        <option *ngFor="let p of purposes">{{p.purpose}}</option>
+        
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="poc">Point of Contact</label>
+        <input
+        type="text"
+        id="poc"
+        class="form-control"
+        ngModel
+        name="poc"
+        required>
+      </div>
+      <div class="form-group">
+        <label for="mobile">Mobile</label>
+        <input
+        type="number"
+        id="mobile"
+        class="form-control"
+        ngModel
+        #mobile="ngModel"
+        name="mobile"
+        minlength="9"
+        maxlength="10"
+        required>
+      </div>
+      <div *ngIf="mobile.touch && ! mobile.valid">
+          <div *ngIf="mobile.errors.minlength">
+              min length is 10
+          </div>
+          <div *ngIf="mobile.errors.maxlength">
+              max length is 10
+           
+          </div>
+        </div>
+      <div class="form-group">
+        <label for="idnumber">ID-Number</label>
+        <input
+        type="text"
+        id="idnumber"
+        class="form-control"
+        ngModel
+        name="idnumber"
+        required>
+      </div>
+      </div>
+      <button
+      class="btn btn-primary"
+      type="submit"
+      [disabled]="!f.valid"
+      
+      >Submit</button>
+    </form>
+    </div>
+  </div>
+</div>
