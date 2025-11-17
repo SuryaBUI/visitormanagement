@@ -1,0 +1,202 @@
+package com.example.rtds;
+
+import com.neovisionaries.ws.client.*;
+import jakarta.annotation.PostConstruct;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.net.Inet4Address;
+import java.net.UnknownHostException;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * RTDS WebSocket Adapter
+ * -----------------------
+ * Connects to an RMDS/RTDS server using tr_json2 WebSocket protocol.
+ * Handles: Login, Ping/Pong, Refresh, Ticks, Auto-Reconnect.
+ *
+ * This class prints ALL messages so you can confirm you are receiving ticks.
+ */
+@Component
+public class RtdsWebSocketAdapter {
+
+    @Value("${rtds.hostname}")
+    private String hostname;
+
+    @Value("${rtds.port}")
+    private String port;
+
+    @Value("${rtds.user}")
+    private String user;
+
+    @Value("${rtds.appId}")
+    private String appId;
+
+    private WebSocket ws;
+    private String position;
+
+    // Reconnect settings
+    private static final int RECONNECT_DELAY_MS = 5000;
+
+    public RtdsWebSocketAdapter() {
+        try {
+            this.position = Inet4Address.getLocalHost().getHostAddress();
+        } catch (UnknownHostException e) {
+            this.position = "127.0.0.1"; // fallback
+        }
+    }
+
+    /**
+     * Initialize connection automatically on Spring Boot startup.
+     */
+    @PostConstruct
+    public void start() {
+        connectWithRetry();
+    }
+
+    /**
+     * Tries to connect. If fails, retries automatically.
+     */
+    private void connectWithRetry() {
+        while (true) {
+            try {
+                connect();
+                return;
+            } catch (Exception e) {
+                System.err.println("Connection failed. Retrying in 5s...");
+                try {
+                    Thread.sleep(RECONNECT_DELAY_MS);
+                } catch (InterruptedException ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Connect to RMDS/RTDS WebSocket Server
+     */
+    public void connect() throws Exception {
+
+        String serverUrl = String.format("ws://%s:%s/WebSocket", hostname, port);
+        System.out.println("------------------------------------------------");
+        System.out.println("Connecting to RMDS WebSocket: " + serverUrl);
+        System.out.println("------------------------------------------------");
+
+        ws = new WebSocketFactory()
+                .createSocket(serverUrl)
+                .addProtocol("tr_json2")
+                .addListener(new WebSocketAdapter() {
+
+                    @Override
+                    public void onConnected(WebSocket websocket, Map<String, List<String>> headers) {
+                        System.out.println("[CONNECTED] Sending Login...");
+                        sendLogin();
+                    }
+
+                    @Override
+                    public void onDisconnected(WebSocket websocket, WebSocketFrame serverCloseFrame,
+                                                WebSocketFrame clientCloseFrame, boolean closedByServer) {
+                        System.err.println("[DISCONNECTED] Trying to reconnect...");
+                        connectWithRetry();
+                    }
+
+                    @Override
+                    public void onTextMessage(WebSocket websocket, String message) {
+                        handleIncomingMessage(message);
+                    }
+                })
+                .addExtension(WebSocketExtension.PERMESSAGE_DEFLATE)
+                .connect();
+
+        System.out.println("[SUCCESS] WebSocket connection established.");
+    }
+
+    /**
+     * Send Login Request
+     */
+    private void sendLogin() {
+
+        JSONObject login = new JSONObject()
+                .put("ID", 1)
+                .put("Domain", "Login")
+                .put("Key", new JSONObject()
+                        .put("Name", user)
+                        .put("Elements", new JSONObject()
+                                .put("ApplicationId", appId)
+                                .put("Position", position)
+                        ));
+
+        ws.sendText(login.toString());
+        System.out.println("[LOGIN SENT]: " + login.toString(2));
+    }
+
+    /**
+     * Handle all incoming messages
+     */
+    private void handleIncomingMessage(String message) {
+        try {
+            JSONArray arr = new JSONArray(message);
+
+            for (int i = 0; i < arr.length(); i++) {
+
+                JSONObject obj = arr.getJSONObject(i);
+                String type = obj.optString("Type");
+
+                switch (type) {
+
+                    case "Refresh":
+                        handleRefresh(obj);
+                        break;
+
+                    case "Ping":
+                        sendPong();
+                        break;
+
+                    default:
+                        System.out.println("[TICK]: " + obj.toString());
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Failed to parse incoming message: " + message);
+            e.printStackTrace();
+        }
+    }
+
+    private void handleRefresh(JSONObject msg) {
+        if ("Login".equals(msg.optString("Domain"))) {
+            System.out.println("[LOGIN SUCCESS] RMDS Login Refresh received.");
+        } else {
+            System.out.println("[REFRESH MESSAGE]: " + msg.toString());
+        }
+    }
+
+    private void sendPong() {
+        JSONObject pong = new JSONObject().put("Type", "Pong");
+        ws.sendText(pong.toString());
+        System.out.println("[PONG SENT]");
+    }
+
+    /**
+     * Subscribe to a RIC for streaming ticks
+     */
+    public void subscribe(String ric, int streamId) {
+
+        JSONObject req = new JSONObject()
+                .put("ID", streamId)
+                .put("Key", new JSONObject().put("Name", ric))
+                .put("Streaming", true);
+
+        ws.sendText(req.toString());
+        System.out.println("[SUBSCRIBE SENT]: " + req.toString(2));
+    }
+
+    public void disconnect() {
+        if (ws != null && ws.isOpen()) {
+            ws.sendClose();
+        }
+        System.out.println("[CLOSED] WebSocket connection closed.");
+    }
+} 
