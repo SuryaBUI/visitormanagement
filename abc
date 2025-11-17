@@ -1,0 +1,533 @@
+Nice — I built a production-ready Spring Boot adapter you can drop into your project.
+It supports auto-reconnect with backoff, multiple subscriptions, thread-safe subscription management, robust exception handling, clear comments, and hooks to plug your own message handler.
+Below you’ll find:
+1.	Maven dependencies you need.
+2.	application.properties keys.
+3.	The full RtdsWebSocketAdapter (Spring @Component) with reconnect & comments.
+4.	Example MarketDataService showing usage and custom handler.
+5.	Step-by-step integration instructions.
+________________________________________
+1) Maven dependencies
+Add these to your pom.xml:
+<dependencies>
+    <!-- nv-websocket-client for websockets -->
+    <dependency>
+        <groupId>com.neovisionaries</groupId>
+        <artifactId>nv-websocket-client</artifactId>
+        <version>2.14</version>
+    </dependency>
+
+    <!-- JSON -->
+    <dependency>
+        <groupId>org.json</groupId>
+        <artifactId>json</artifactId>
+        <version>20230227</version>
+    </dependency>
+
+    <!-- Apache Commons Lang (optional helpers) -->
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>3.12.0</version>
+    </dependency>
+
+    <!-- SLF4J logging -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>2.0.7</version>
+    </dependency>
+</dependencies>
+(If you use Spring Boot starter, logging and commons are usually already present.)
+________________________________________
+2) application.properties
+Add these RTDS settings to src/main/resources/application.properties:
+# RTDS connection properties
+rtds.hostname=127.0.0.1
+rtds.port=15000
+rtds.user=root
+rtds.appId=256
+
+# Reconnect/backoff tuning
+rtds.reconnect.initialMillis=1000
+rtds.reconnect.maxMillis=30000
+rtds.reconnect.maxAttempts=0   # 0 = unlimited
+
+# Optional: log-levels in application.properties (if using Spring Boot)
+logging.level.com.example.rtds=INFO
+________________________________________
+3) RtdsWebSocketAdapter (Spring Component with reconnect & comments)
+Create file src/main/java/com/example/rtds/RtdsWebSocketAdapter.java:
+package com.example.rtds;
+
+import com.neovisionaries.ws.client.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+/**
+ * RTDS WebSocket Adapter (Spring component).
+ *
+ * Features:
+ * - Reads connection properties from application.properties (@Value)
+ * - Automatic reconnect with exponential backoff
+ * - Thread-safe subscription management (multiple RICs)
+ * - Robust exception handling and logging
+ * - Allows setting a custom Consumer<JSONObject> messageHandler
+ */
+@Component
+public class RtdsWebSocketAdapter {
+
+    private static final Logger log = LoggerFactory.getLogger(RtdsWebSocketAdapter.class);
+
+    // Connection properties populated from application.properties
+    @Value("${rtds.hostname}")
+    private String hostname;
+
+    @Value("${rtds.port}")
+    private String port;
+
+    @Value("${rtds.user}")
+    private String user;
+
+    @Value("${rtds.appId}")
+    private String appId;
+
+    // Reconnect/backoff tuning
+    @Value("${rtds.reconnect.initialMillis:1000}")
+    private long reconnectInitialMillis;
+
+    @Value("${rtds.reconnect.maxMillis:30000}")
+    private long reconnectMaxMillis;
+
+    @Value("${rtds.reconnect.maxAttempts:0}")
+    private int reconnectMaxAttempts; // 0 = unlimited
+
+    private String position;
+    private volatile WebSocket ws;
+
+    // Message handler called for non-control messages (default prints)
+    private volatile Consumer<JSONObject> messageHandler = msg -> log.info("STREAM MSG: {}", msg.toString());
+
+    // Subscription storage: streamId -> ric
+    private final ConcurrentMap<Integer, String> subscriptions = new ConcurrentHashMap<>();
+
+    // For generating unique stream IDs if caller doesn't provide one
+    private final AtomicInteger idGenerator = new AtomicInteger(100);
+
+    // Executor services
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "rtds-reconnect-scheduler");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private final ExecutorService messageProcessor = Executors.newFixedThreadPool(2, r -> {
+        Thread t = new Thread(r, "rtds-msg-processor");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private final Object connectLock = new Object(); // guard for connect/disconnect
+
+    private volatile boolean closed = false; // when application shuts down
+
+    public RtdsWebSocketAdapter() {
+        try {
+            this.position = Inet4Address.getLocalHost().getHostAddress();
+        } catch (UnknownHostException e) {
+            this.position = "127.0.0.1";
+            log.warn("Unable to determine local host address, defaulting to {}", this.position, e);
+        }
+    }
+
+    /**
+     * Initialize on Spring startup.
+     */
+    @PostConstruct
+    public void init() {
+        // Connect asynchronously so App context won't stall if RTDS unavailable
+        scheduler.execute(() -> {
+            try {
+                connectWithRetry();
+            } catch (Exception e) {
+                log.error("Initial connection attempt failed and exhausted retries", e);
+            }
+        });
+    }
+
+    /**
+     * Tries to connect and retries using exponential backoff until success or max attempts reached.
+     */
+    private void connectWithRetry() {
+        long delay = reconnectInitialMillis;
+        int attempt = 0;
+
+        while (!closed && (reconnectMaxAttempts == 0 || attempt < reconnectMaxAttempts)) {
+            attempt++;
+            try {
+                connect();
+                log.info("Connected to RTDS WebSocket on attempt {}", attempt);
+                return; // successful connect -> exit
+            } catch (Exception e) {
+                log.warn("Attempt {} to connect failed: {}", attempt, e.getMessage());
+                if (closed) return;
+                try {
+                    log.info("Reconnecting after {} ms (attempt {})", delay, attempt);
+                    Thread.sleep(delay);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                delay = Math.min(delay * 2, reconnectMaxMillis);
+            }
+        }
+        log.error("Exceeded maximum reconnect attempts (attempts={})", attempt);
+    }
+
+    /**
+     * Establish WebSocket connection and set listeners.
+     * Throws exception to be handled by caller.
+     */
+    public void connect() throws IOException, WebSocketException {
+        synchronized (connectLock) {
+            if (closed) throw new IllegalStateException("Adapter is closed");
+            String server = String.format("ws://%s:%s/WebSocket", hostname, port);
+            log.info("Connecting to RTDS WebSocket: {}", server);
+
+            // Close any existing socket
+            if (ws != null && ws.isOpen()) {
+                try {
+                    ws.sendClose();
+                } catch (Exception e) {
+                    log.warn("Error closing previous websocket", e);
+                }
+            }
+
+            // Create the socket
+            ws = new WebSocketFactory()
+                    .createSocket(server)
+                    .addProtocol("tr_json2")
+                    .addListener(new WebSocketAdapter() {
+
+                        @Override
+                        public void onConnected(WebSocket websocket, Map<String, List<String>> headers) {
+                            log.info("WebSocket connected. Sending login...");
+                            try {
+                                sendLoginRequest();
+                            } catch (Exception e) {
+                                log.error("Failed to send login request", e);
+                            }
+                        }
+
+                        @Override
+                        public void onDisconnected(WebSocket websocket,
+                                                   WebSocketFrame serverCloseFrame,
+                                                   WebSocketFrame clientCloseFrame,
+                                                   boolean closedByServer) {
+                            log.warn("WebSocket disconnected (closedByServer={})", closedByServer);
+                            // schedule reconnect
+                            scheduleReconnect();
+                        }
+
+                        @Override
+                        public void onTextMessage(WebSocket websocket, String message) {
+                            // Offload parsing/processing to thread pool to keep socket listener responsive
+                            messageProcessor.submit(() -> handleTextMessage(message));
+                        }
+
+                        @Override
+                        public void onError(WebSocket websocket, WebSocketException cause) {
+                            log.error("WebSocket error", cause);
+                            scheduleReconnect();
+                        }
+                    })
+                    .addExtension(WebSocketExtension.PERMESSAGE_DEFLATE)
+                    .connect();
+
+            log.info("WebSocket connect() returned, socket open? {}", ws.isOpen());
+        }
+    }
+
+    /**
+     * Schedules a reconnect attempt using scheduler (not blocking current thread).
+     */
+    private void scheduleReconnect() {
+        if (closed) return;
+        // schedule connectWithRetry in background
+        scheduler.schedule(this::connectWithRetry, reconnectInitialMillis, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Send login request to RTDS.
+     */
+    private void sendLoginRequest() {
+        try {
+            JSONObject login = new JSONObject()
+                    .put("ID", 1)
+                    .put("Domain", "Login")
+                    .put("Key", new JSONObject()
+                            .put("Name", user)
+                            .put("Elements", new JSONObject()
+                                    .put("ApplicationId", appId)
+                                    .put("Position", position)
+                            )
+                    );
+            sendText(login.toString());
+            log.info("SENT LOGIN: {}", login.toString(2));
+        } catch (Exception e) {
+            log.error("Error building/sending login request", e);
+        }
+    }
+
+    /**
+     * Handles raw text message from WebSocket.
+     * Accepts both single object and JSON array strings returned by server.
+     */
+    private void handleTextMessage(String raw) {
+        if (raw == null || raw.isEmpty()) return;
+        try {
+            // RTDS often sends a JSON array of messages
+            if (raw.trim().startsWith("[")) {
+                JSONArray arr = new JSONArray(raw);
+                for (int i = 0; i < arr.length(); i++) {
+                    processMessage(arr.getJSONObject(i));
+                }
+            } else {
+                // Single JSON object
+                JSONObject obj = new JSONObject(raw);
+                processMessage(obj);
+            }
+        } catch (Exception e) {
+            log.error("Failed to parse/process message: {}", raw, e);
+        }
+    }
+
+    /**
+     * Processes a single JSON message and handles control messages (Refresh/Ping) and forwards other messages.
+     */
+    private void processMessage(JSONObject msg) {
+        String type = msg.optString("Type", "");
+        switch (type) {
+            case "Refresh":
+                if ("Login".equals(msg.optString("Domain"))) {
+                    log.info("Login refresh received. Ready for subscriptions.");
+                    // Re-subscribe to all stored subscriptions after successful login
+                    resubscribeAll();
+                }
+                break;
+
+            case "Ping":
+                // reply with Pong
+                try {
+                    JSONObject pong = new JSONObject().put("Type", "Pong");
+                    sendText(pong.toString());
+                    log.debug("SENT Pong");
+                } catch (Exception e) {
+                    log.error("Failed to send Pong", e);
+                }
+                break;
+
+            default:
+                // Forward non-control messages to the configured handler
+                try {
+                    messageHandler.accept(msg);
+                } catch (Exception e) {
+                    log.error("Message handler threw an exception for message: {}", msg, e);
+                }
+                break;
+        }
+    }
+
+    /**
+     * Thread-safe send text to ws with checks and logging.
+     */
+    private void sendText(String text) {
+        synchronized (connectLock) {
+            if (ws == null || !ws.isOpen()) {
+                log.warn("WebSocket is not open. Cannot send message.");
+                return;
+            }
+            try {
+                ws.sendText(text);
+            } catch (Exception e) {
+                log.error("Failed to send text over WebSocket", e);
+            }
+        }
+    }
+
+    /**
+     * Subscribe with an explicit streamId.
+     * If websocket is not ready, subscription is stored and will be resent after reconnect.
+     */
+    public void subscribe(String ric, int streamId) {
+        if (ric == null || ric.isEmpty()) throw new IllegalArgumentException("RIC must not be null/empty");
+        subscriptions.put(streamId, ric);
+
+        JSONObject req = new JSONObject()
+                .put("ID", streamId)
+                .put("Key", new JSONObject().put("Name", ric))
+                .put("Streaming", true);
+
+        sendText(req.toString());
+        log.info("SENT SUBSCRIPTION: {} -> {}", streamId, ric);
+    }
+
+    /**
+     * Subscribe with auto-generated stream id.
+     * Returns the stream id used for the subscription.
+     */
+    public int subscribe(String ric) {
+        int streamId = idGenerator.getAndIncrement();
+        subscribe(ric, streamId);
+        return streamId;
+    }
+
+    /**
+     * Unsubscribe (close stream) for a particular streamId.
+     */
+    public void unsubscribe(int streamId) {
+        String ric = subscriptions.remove(streamId);
+        if (ric == null) {
+            log.warn("No subscription found for streamId {}", streamId);
+            return;
+        }
+        JSONObject req = new JSONObject()
+                .put("ID", streamId)
+                .put("Key", new JSONObject().put("Name", ric))
+                .put("Streaming", false); // streaming=false typically means close
+        sendText(req.toString());
+        log.info("SENT UNSUBSCRIBE for {} (streamId={})", ric, streamId);
+    }
+
+    /**
+     * Re-send all stored subscriptions (used after reconnect/login).
+     */
+    private void resubscribeAll() {
+        if (subscriptions.isEmpty()) return;
+        log.info("Resubscribing to {} instruments", subscriptions.size());
+        subscriptions.forEach((streamId, ric) -> {
+            JSONObject req = new JSONObject()
+                    .put("ID", streamId)
+                    .put("Key", new JSONObject().put("Name", ric))
+                    .put("Streaming", true);
+            sendText(req.toString());
+            log.info("Resent subscription {} -> {}", streamId, ric);
+        });
+    }
+
+    /**
+     * Allows application to set its own message handler.
+     */
+    public void setMessageHandler(Consumer<JSONObject> handler) {
+        if (handler == null) throw new IllegalArgumentException("handler must not be null");
+        this.messageHandler = handler;
+    }
+
+    /**
+     * Gracefully disconnect and shutdown executors.
+     */
+    @PreDestroy
+    public void close() {
+        closed = true;
+        synchronized (connectLock) {
+            if (ws != null) {
+                try {
+                    if (ws.isOpen()) ws.sendClose();
+                } catch (Exception e) {
+                    log.warn("Error while closing websocket", e);
+                }
+            }
+            try {
+                if (!scheduler.isShutdown()) scheduler.shutdownNow();
+            } catch (Exception e) { /* ignore */ }
+            try {
+                if (!messageProcessor.isShutdown()) messageProcessor.shutdownNow();
+            } catch (Exception e) { /* ignore */ }
+            log.info("RtdsWebSocketAdapter closed");
+        }
+    }
+}
+Notes about the adapter:
+•	It uses scheduler to retry connections in background and not block Spring startup.
+•	resubscribeAll() resends persisted subscriptions after a successful login/refresh.
+•	All send operations check socket state and log errors.
+•	subscribe(String ric) returns a generated stream id (useful if you want to manage unsubscriptions).
+•	setMessageHandler lets you plug your own processing pipeline.
+________________________________________
+4) Example MarketDataService showing integration
+Create src/main/java/com/example/rtds/MarketDataService.java:
+package com.example.rtds;
+
+import org.json.JSONObject;
+import org.springframework.stereotype.Service;
+
+import jakarta.annotation.PostConstruct;
+
+@Service
+public class MarketDataService {
+
+    private final RtdsWebSocketAdapter adapter;
+
+    public MarketDataService(RtdsWebSocketAdapter adapter) {
+        this.adapter = adapter;
+    }
+
+    @PostConstruct
+    public void start() {
+        // Provide a custom message handler: parse Fields and push into your pipeline
+        adapter.setMessageHandler(json -> {
+            try {
+                if (json.has("Fields")) {
+                    JSONObject fields = json.getJSONObject("Fields");
+                    // TODO: transform and persist to DB / Kafka / in-memory cache
+                    System.out.println("Tick: " + fields.toString());
+                } else {
+                    // non-Fields messages (e.g., Refresh, Status)
+                    System.out.println("Meta message: " + json.toString());
+                }
+            } catch (Exception e) {
+                // Keep handler robust; do not allow exceptions to bubble up
+                System.err.println("Handler error: " + e.getMessage());
+                e.printStackTrace();
+            }
+        });
+
+        // Subscribe to tickers
+        adapter.subscribe("TRI.N");   // returns streamId if you want to manage it
+        adapter.subscribe("IBM.N");
+    }
+}
+________________________________________
+5) Step-by-step Integration Process
+1.	Add Maven dependencies listed above and run mvn clean install.
+2.	Add properties to application.properties (hostname, port, user, appId, reconnect options).
+3.	Copy RtdsWebSocketAdapter.java into com.example.rtds package (or your package).
+4.	Copy MarketDataService.java or create your own service that injects the adapter.
+5.	Customize messageHandler inside your service to push messages to DB / Kafka / in-memory cache. Keep message handler exception-safe.
+6.	Run your Spring Boot app. The adapter will attempt to connect asynchronously at startup. Logs will show connection/login/subscription activity.
+7.	If your RTDS requires TLS or custom headers, update createSocket(...).setSocket(...) or use wss:// and configure SSL on the WebSocketFactory per nv-websocket-client docs.
+8.	To test: start a local RTDS/ADS test server, or point to the real endpoint and monitor logs. Use adapter.subscribe("RIC") dynamically at runtime if desired.
+9.	Monitoring & metrics: add counters/metrics around messageHandler and connection attempts (optional) for production observability.
+10.	Graceful shutdown: @PreDestroy ensures the adapter attempts to close socket and stop executors on application stop.
+________________________________________
+6) Optional improvements you can request next
+•	Add TLS (wss) and certificate configuration.
+•	Add OAuth/token-based login if your RTDS needs it.
+•	Integrate with Micrometer to expose connection/subscription metrics.
+•	Persist subscription list to disk so it survives application restarts.
+•	Add exponential jitter or Fibonacci backoff for reconnections.
+
